@@ -2,7 +2,9 @@
 # =============================================================
 #  Linux Build Script: Cross-compile auto_warm_up.py to a
 #  Windows .exe using Docker (Wine + Python + PyInstaller).
-#  No Wine installation needed on host — Docker handles it.
+#  Generates icon, embeds PE version info, and self-signs the
+#  .exe — all inside Docker. No Wine or signing tools needed
+#  on the host machine.
 # =============================================================
 
 set -e

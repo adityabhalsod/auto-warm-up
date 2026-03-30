@@ -1,0 +1,290 @@
+# =============================================================
+#  GitHub Actions CI/CD Pipeline — Auto Warm-Up
+#  3-Stage Pipeline: Prepare → Build → Release
+#  Builds Windows .exe on ubuntu-latest via Docker (Wine)
+#  Embeds icon, PE version info, and self-signed certificate
+#  No environment variables or secrets required (except GITHUB_TOKEN)
+# =============================================================
+
+name: Build & Release
+
+# Trigger on pushes to release branches only
+on:
+  push:
+    branches:
+      - main    # Stable releases (v1.0.0)
+      - beta    # Pre-release beta builds (v1.0.0-beta.3)
+      - alpha   # Pre-release alpha builds (v1.0.0-alpha.7)
+
+# Only one release per branch at a time; cancel in-progress runs
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # =========================================================
+  #  STAGE 1: PREPARE — Compute version, changelog, channel
+  # =========================================================
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+
+    # Skip CI if commit message contains [skip ci] or [ci skip]
+    if: >-
+      !contains(github.event.head_commit.message, '[skip ci]') &&
+      !contains(github.event.head_commit.message, '[ci skip]')
+
+    outputs:
+      # Expose computed values to downstream jobs
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      channel: ${{ steps.version.outputs.channel }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+
+    steps:
+      # Check out the full repo history (needed for commit counting)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history required for commit count and changelog
+
+      # Compute semantic version based on branch and commit count
+      - name: Compute version
+        id: version
+        run: |
+          # Read base version from the VERSION file (e.g. 1.0.0)
+          BASE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          # Get the current branch name
+          BRANCH="${GITHUB_REF_NAME}"
+          # Count total commits on this branch for pre-release suffix
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+
+          # Determine release channel and tag format based on branch
+          if [ "$BRANCH" = "main" ]; then
+            # Stable release: version matches VERSION file exactly
+            VERSION="$BASE_VERSION"
+            TAG="v${VERSION}"
+            CHANNEL="stable"
+            PRERELEASE="false"
+          elif [ "$BRANCH" = "beta" ]; then
+            # Beta pre-release: append -beta.<commit_count>
+            VERSION="${BASE_VERSION}-beta.${COMMIT_COUNT}"
+            TAG="v${VERSION}"
+            CHANNEL="beta"
+            PRERELEASE="true"
+          elif [ "$BRANCH" = "alpha" ]; then
+            # Alpha pre-release: append -alpha.<commit_count>
+            VERSION="${BASE_VERSION}-alpha.${COMMIT_COUNT}"
+            TAG="v${VERSION}"
+            CHANNEL="alpha"
+            PRERELEASE="true"
+          fi
+
+          # Export computed values as step outputs
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+
+          # Log the computed version info for debugging
+          echo "📦 Version: ${VERSION}"
+          echo "🏷️  Tag: ${TAG}"
+          echo "📡 Channel: ${CHANNEL}"
+
+      # Generate a conventional-commit-style changelog since the last tag
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Find the most recent tag to use as the changelog baseline
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+          if [ -z "$LAST_TAG" ]; then
+            # No prior tag exists — include all commits
+            COMMIT_RANGE="HEAD"
+          else
+            # Use commits since the last tag
+            COMMIT_RANGE="${LAST_TAG}..HEAD"
+          fi
+
+          # Build categorized changelog from conventional commit prefixes
+          CHANGELOG=""
+
+          # Collect feature commits (feat: prefix)
+          FEATURES=$(git log "$COMMIT_RANGE" --pretty=format:"- %s" --grep="^feat:" 2>/dev/null || true)
+          if [ -n "$FEATURES" ]; then
+            CHANGELOG="${CHANGELOG}### ✨ Features\n${FEATURES}\n\n"
+          fi
+
+          # Collect bug fix commits (fix: prefix)
+          FIXES=$(git log "$COMMIT_RANGE" --pretty=format:"- %s" --grep="^fix:" 2>/dev/null || true)
+          if [ -n "$FIXES" ]; then
+            CHANGELOG="${CHANGELOG}### 🐛 Bug Fixes\n${FIXES}\n\n"
+          fi
+
+          # Collect performance improvement commits (perf: prefix)
+          PERF=$(git log "$COMMIT_RANGE" --pretty=format:"- %s" --grep="^perf:" 2>/dev/null || true)
+          if [ -n "$PERF" ]; then
+            CHANGELOG="${CHANGELOG}### ⚡ Performance\n${PERF}\n\n"
+          fi
+
+          # Collect documentation commits (docs: prefix)
+          DOCS=$(git log "$COMMIT_RANGE" --pretty=format:"- %s" --grep="^docs:" 2>/dev/null || true)
+          if [ -n "$DOCS" ]; then
+            CHANGELOG="${CHANGELOG}### 📚 Documentation\n${DOCS}\n\n"
+          fi
+
+          # Fallback: if no conventional commits found, list all commits
+          if [ -z "$CHANGELOG" ]; then
+            ALL_COMMITS=$(git log "$COMMIT_RANGE" --pretty=format:"- %s" 2>/dev/null || true)
+            if [ -n "$ALL_COMMITS" ]; then
+              CHANGELOG="### 📝 Changes\n${ALL_COMMITS}\n"
+            else
+              CHANGELOG="### 📝 Changes\n- Initial release\n"
+            fi
+          fi
+
+          # Write changelog to output using heredoc delimiter for multiline
+          {
+            echo "changelog<<CHANGELOG_EOF"
+            echo -e "$CHANGELOG"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  # =========================================================
+  #  STAGE 2: BUILD — Cross-compile, embed icon/version, sign
+  # =========================================================
+  build:
+    name: Build & Sign Windows .exe
+    runs-on: ubuntu-latest
+    needs: prepare  # Wait for version info from prepare stage
+
+    steps:
+      # Check out the source code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Reclaim disk space on the runner for the Docker build
+      - name: Free disk space
+        run: |
+          # Remove unused runner toolchains to free ~10 GB
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
+      # Inject the computed version into the VERSION file before Docker build
+      # This ensures the .exe embeds the correct version (including pre-release suffix)
+      - name: Set version for build
+        run: |
+          # Write the computed version (e.g. 1.0.0-beta.3) into VERSION file
+          echo "${{ needs.prepare.outputs.version }}" > VERSION
+          echo "Building with version: $(cat VERSION)"
+
+      # Build the Docker image — this generates icon, version info, builds .exe, and signs it
+      - name: Build signed .exe via Docker (Wine + PyInstaller + osslsigncode)
+        uses: docker/build-push-action@v5
+        with:
+          context: .               # Use the repo root as Docker context
+          push: false              # Don't push to a registry, just build locally
+          load: true               # Load the built image into the local Docker daemon
+          tags: auto-warm-up-builder:latest
+          cache-from: type=gha     # Pull cache layers from GitHub Actions cache
+          cache-to: type=gha,mode=max  # Push all layers to cache for next build
+
+      # Extract the signed .exe from the Docker container to the runner filesystem
+      - name: Extract signed .exe from container
+        run: |
+          # Create a temporary container from the built image (don't start it)
+          CONTAINER_ID=$(docker create auto-warm-up-builder:latest)
+          # Create output directory on the runner
+          mkdir -p dist
+          # Copy the signed .exe out of the container's /app/dist/ directory
+          docker cp "${CONTAINER_ID}:/app/dist/AutoWarmUp.exe" dist/AutoWarmUp.exe
+          # Clean up the temporary container
+          docker rm "${CONTAINER_ID}"
+          # Verify the .exe was extracted and show its size
+          ls -lh dist/AutoWarmUp.exe
+
+      # Verify the .exe has proper PE metadata and signature
+      - name: Verify .exe metadata
+        run: |
+          # Install osslsigncode on the runner to verify the signature
+          sudo apt-get update && sudo apt-get install -y osslsigncode
+          # Check that the digital signature is present
+          echo "=== Signature Verification ==="
+          osslsigncode verify dist/AutoWarmUp.exe 2>&1 | head -10 || true
+          # Show file details
+          echo ""
+          echo "=== File Details ==="
+          file dist/AutoWarmUp.exe
+          ls -lh dist/AutoWarmUp.exe
+
+      # Upload the signed .exe as a build artifact for the release stage
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoWarmUp-exe               # Artifact name for download
+          path: dist/AutoWarmUp.exe          # Path to the signed executable
+          retention-days: 5                  # Keep artifact for 5 days
+          if-no-files-found: error           # Fail if .exe wasn't produced
+
+  # =========================================================
+  #  STAGE 3: RELEASE — Tag repo and publish GitHub Release
+  # =========================================================
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [prepare, build]  # Wait for both version info and the signed .exe
+
+    permissions:
+      contents: write  # Required to create tags and releases
+
+    steps:
+      # Check out the repo (needed for git tagging)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Download the signed .exe artifact from the build stage
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: AutoWarmUp-exe   # Must match the upload artifact name
+          path: dist/            # Download into the dist/ directory
+
+      # Create a git tag for this version and push it
+      - name: Create git tag
+        run: |
+          # Configure git identity for the tag
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Create and push the annotated tag
+          TAG="${{ needs.prepare.outputs.tag }}"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+
+      # Publish a GitHub Release with the signed .exe attached
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}         # e.g. v1.0.0 or v1.0.0-beta.3
+          name: Auto Warm-Up ${{ needs.prepare.outputs.version }}  # Release title
+          body: |
+            ## Auto Warm-Up ${{ needs.prepare.outputs.version }}
+
+            **Channel:** ${{ needs.prepare.outputs.channel }}
+            **Branch:** ${{ github.ref_name }}
+
+            ${{ needs.prepare.outputs.changelog }}
+
+            ---
+
+            ### 🛡️ Binary Details
+            - **Icon:** Embedded multi-resolution application icon
+            - **Version Info:** PE metadata with company, description, and version
+            - **Signed:** Self-signed certificate (reduces antivirus false positives)
+            - **No installation required** — just download and double-click
+
+            > 💡 Download `AutoWarmUp.exe` below and double-click to run.
+          prerelease: ${{ needs.prepare.outputs.prerelease }}  # Mark beta/alpha as pre-release
+          files: dist/AutoWarmUp.exe                           # Attach the signed .exe as release asset
