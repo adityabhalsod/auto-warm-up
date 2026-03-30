@@ -144,7 +144,7 @@ Go to [Releases](../../releases/latest) and download `AutoWarmUp.exe`. That's it
 
 ```cmd
 :: Clone the repository
-git clone https://github.com/YOUR_USERNAME/auto-warm-up.git
+git clone https://github.com/adityabhalsod/auto-warm-up.git
 cd auto-warm-up
 
 :: Run the build script
