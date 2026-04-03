@@ -2,8 +2,15 @@
 #  GitHub Actions CI/CD Pipeline — Auto Warm-Up
 #  3-Stage Pipeline: Prepare → Build → Release
 #  Builds Windows .exe on ubuntu-latest via Docker (Wine)
-#  Embeds icon, PE version info, and self-signed certificate
-#  No environment variables or secrets required (except GITHUB_TOKEN)
+#  Signs with CA certificate if secrets are configured
+#  Falls back to self-signed if no certificate is available
+#
+#  To enable Publisher on SmartScreen, add these repo secrets:
+#    CODESIGN_PFX_BASE64  — base64-encoded .pfx certificate
+#    CODESIGN_PFX_PASSWORD — password for the .pfx file
+#
+#  To encode your .pfx:
+#    base64 -w 0 your-certificate.pfx | pbcopy
 # =============================================================
 
 name: Build & Release
@@ -196,29 +203,37 @@ jobs:
           cache-from: type=gha     # Pull cache layers from GitHub Actions cache
           cache-to: type=gha,mode=max  # Push all layers to cache for next build
 
-      # Extract the signed .exe from the Docker container to the runner filesystem
-      - name: Extract signed .exe from container
+      # Extract the unsigned .exe from the Docker container to the runner filesystem
+      - name: Extract .exe from container
         run: |
           # Create a temporary container from the built image (don't start it)
           CONTAINER_ID=$(docker create auto-warm-up-builder:latest)
           # Create output directory on the runner
           mkdir -p dist
-          # Copy the signed .exe out of the container's /app/dist/ directory
+          # Copy the unsigned .exe out of the container's /app/dist/ directory
           docker cp "${CONTAINER_ID}:/app/dist/AutoWarmUp.exe" dist/AutoWarmUp.exe
           # Clean up the temporary container
           docker rm "${CONTAINER_ID}"
           # Verify the .exe was extracted and show its size
           ls -lh dist/AutoWarmUp.exe
 
-      # Verify the .exe has proper PE metadata and signature
-      - name: Verify .exe metadata
+      # Sign the .exe on the runner (outside Docker to keep secrets safe)
+      # Uses CA certificate from secrets if available, otherwise self-signed fallback
+      - name: Sign .exe (Authenticode)
         run: |
-          # Install osslsigncode on the runner to verify the signature
-          sudo apt-get update && sudo apt-get install -y osslsigncode
-          # Check that the digital signature is present
+          # Install osslsigncode and openssl on the runner
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends osslsigncode openssl
+          # Run the signing script — it auto-detects CA vs self-signed mode
+          bash sign_exe.sh dist/AutoWarmUp.exe "Auto Warm-Up" "https://github.com/adityabhalsod/auto-warm-up"
+        env:
+          CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
+          CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
+
+      # Verify the .exe has proper PE metadata and signature
+      - name: Verify .exe signature
+        run: |
           echo "=== Signature Verification ==="
-          osslsigncode verify dist/AutoWarmUp.exe 2>&1 | head -10 || true
-          # Show file details
+          osslsigncode verify dist/AutoWarmUp.exe 2>&1 | head -15 || true
           echo ""
           echo "=== File Details ==="
           file dist/AutoWarmUp.exe
@@ -283,10 +298,10 @@ jobs:
 
             ---
 
-            ### 🛡️ Binary Details
+            ### Binary Details
             - **Icon:** Embedded multi-resolution application icon
             - **Version Info:** PE metadata with company, description, and version
-            - **Signed:** Self-signed certificate (reduces antivirus false positives)
+            - **Signed:** Authenticode signed (SHA-256 + RFC 3161 timestamp)
             - **No installation required** — just download and double-click
 
             > 💡 Download `AutoWarmUp.exe` below and double-click to run.

@@ -4,11 +4,6 @@ FROM tobix/pywine:3.12
 # Set working directory inside the container
 WORKDIR /app
 
-# Install osslsigncode for self-signing the .exe (reduces AV false positives)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    osslsigncode openssl \
-    && rm -rf /var/lib/apt/lists/*
-
 # Copy dependency list first (leverages Docker layer caching)
 COPY requirements.txt .
 
@@ -16,7 +11,7 @@ COPY requirements.txt .
 RUN xvfb-run sh -c "wine pip install -r requirements.txt; wineserver -w"
 
 # Copy all build scripts and source code into the container
-COPY auto_warm_up.py generate_icon.py generate_version_info.py sign_exe.sh VERSION ./
+COPY auto_warm_up.py generate_icon.py generate_version_info.py VERSION ./
 
 # Step 1: Generate the multi-size .ico icon file using Pillow (runs under Wine Python)
 RUN xvfb-run sh -c "wine python generate_icon.py app.ico; wineserver -w"
@@ -25,6 +20,7 @@ RUN xvfb-run sh -c "wine python generate_icon.py app.ico; wineserver -w"
 RUN xvfb-run sh -c "wine python generate_version_info.py; wineserver -w"
 
 # Step 3: Build the standalone .exe with icon and version info embedded
+# Signing is done OUTSIDE Docker (on the CI runner) to keep secrets out of image layers
 RUN xvfb-run sh -c "\
     wine pyinstaller \
     --onefile \
@@ -34,9 +30,6 @@ RUN xvfb-run sh -c "\
     --version-file=version_info.txt \
     auto_warm_up.py; \
     wineserver -w"
-
-# Step 4: Self-sign the .exe with a generated certificate (no external secrets needed)
-RUN bash sign_exe.sh dist/AutoWarmUp.exe "Auto Warm-Up" "https://github.com/adityabhalsod/auto-warm-up"
 
 # Default command: list the output to confirm the build succeeded
 CMD ["ls", "-lh", "dist/"]
