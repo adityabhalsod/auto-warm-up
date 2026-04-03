@@ -1,16 +1,15 @@
 # =============================================================
 #  GitHub Actions CI/CD Pipeline — Auto Warm-Up
-#  3-Stage Pipeline: Prepare → Build → Release
+#  4-Stage Pipeline: Prepare → Build → Sign → Release
 #  Builds Windows .exe on ubuntu-latest via Docker (Wine)
-#  Signs with CA certificate if secrets are configured
-#  Falls back to self-signed if no certificate is available
 #
-#  To enable Publisher on SmartScreen, add these repo secrets:
-#    CODESIGN_PFX_BASE64  — base64-encoded .pfx certificate
-#    CODESIGN_PFX_PASSWORD — password for the .pfx file
-#
-#  To encode your .pfx:
-#    base64 -w 0 your-certificate.pfx | pbcopy
+#  Signing options (in priority order):
+#    1. SignPath.io (free for OSS) — real CA certificate, Publisher shown
+#       Set secrets: SIGNPATH_API_TOKEN, SIGNPATH_ORGANIZATION_ID,
+#                    SIGNPATH_SIGNING_POLICY_SLUG, SIGNPATH_PROJECT_SLUG
+#    2. Custom PFX certificate — any CA-issued .pfx
+#       Set secrets: CODESIGN_PFX_BASE64, CODESIGN_PFX_PASSWORD
+#    3. Self-signed fallback — no secrets needed (Publisher hidden)
 # =============================================================
 
 name: Build & Release
@@ -203,35 +202,111 @@ jobs:
           cache-from: type=gha     # Pull cache layers from GitHub Actions cache
           cache-to: type=gha,mode=max  # Push all layers to cache for next build
 
-      # Extract the unsigned .exe from the Docker container to the runner filesystem
+      # Extract the .exe from the Docker container to the runner filesystem
       - name: Extract .exe from container
         run: |
           # Create a temporary container from the built image (don't start it)
           CONTAINER_ID=$(docker create auto-warm-up-builder:latest)
           # Create output directory on the runner
           mkdir -p dist
-          # Copy the unsigned .exe out of the container's /app/dist/ directory
+          # Copy the .exe out of the container's /app/dist/ directory
           docker cp "${CONTAINER_ID}:/app/dist/AutoWarmUp.exe" dist/AutoWarmUp.exe
           # Clean up the temporary container
           docker rm "${CONTAINER_ID}"
           # Verify the .exe was extracted and show its size
           ls -lh dist/AutoWarmUp.exe
 
-      # Sign the .exe on the runner (outside Docker to keep secrets safe)
-      # Uses CA certificate from secrets if available, otherwise self-signed fallback
-      - name: Sign .exe (Authenticode)
+      # Upload the unsigned .exe as a build artifact for the signing stage
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoWarmUp-unsigned          # Artifact name for the unsigned build
+          path: dist/AutoWarmUp.exe          # Path to the built executable
+          retention-days: 5                  # Keep artifact for 5 days
+          if-no-files-found: error           # Fail if .exe wasn't produced
+
+  # =========================================================
+  #  STAGE 3: SIGN — Sign the .exe with a trusted certificate
+  #  Priority: SignPath.io → Custom PFX → Self-signed fallback
+  # =========================================================
+  sign:
+    name: Sign .exe
+    runs-on: ubuntu-latest
+    needs: [prepare, build]  # Wait for version info and the built .exe
+
+    steps:
+      # Check out the repo (needed for sign_exe.sh fallback)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Download the unsigned .exe from the build stage
+      - name: Download unsigned .exe
+        uses: actions/download-artifact@v4
+        with:
+          name: AutoWarmUp-unsigned
+          path: dist/
+
+      # Detect which signing method is available
+      - name: Detect signing method
+        id: detect
+        run: |
+          # Check if SignPath.io secrets are configured
+          if [ -n "${SIGNPATH_TOKEN}" ]; then
+            echo "method=signpath" >> "$GITHUB_OUTPUT"
+            echo "Detected: SignPath.io secrets configured"
+          elif [ -n "${PFX_BASE64}" ]; then
+            echo "method=pfx" >> "$GITHUB_OUTPUT"
+            echo "Detected: Custom PFX certificate configured"
+          else
+            echo "method=selfsigned" >> "$GITHUB_OUTPUT"
+            echo "Detected: No signing secrets — using self-signed fallback"
+          fi
+        env:
+          SIGNPATH_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
+
+      # Option 1: Sign with SignPath.io (free for open-source projects)
+      # Requires: SIGNPATH_API_TOKEN, SIGNPATH_ORGANIZATION_ID,
+      #           SIGNPATH_SIGNING_POLICY_SLUG, SIGNPATH_PROJECT_SLUG
+      - name: Sign with SignPath.io
+        if: steps.detect.outputs.method == 'signpath'
+        id: signpath
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: "AutoWarmUp"
+          github-artifact-id: AutoWarmUp-unsigned
+          wait-for-completion: true
+          output-artifact-directory: dist/signed
+
+      # Move SignPath signed file to the expected location
+      - name: Use SignPath signed .exe
+        if: steps.detect.outputs.method == 'signpath'
+        run: |
+          # Replace the unsigned .exe with the SignPath-signed version
+          cp dist/signed/AutoWarmUp.exe dist/AutoWarmUp.exe
+          echo "Signed with SignPath.io (CA certificate — Publisher will appear)"
+
+      # Option 2: Sign with custom PFX or self-signed fallback
+      # Runs only if SignPath was not used
+      - name: Sign with PFX or self-signed fallback
+        if: steps.detect.outputs.method != 'signpath'
         run: |
           # Install osslsigncode and openssl on the runner
           sudo apt-get update && sudo apt-get install -y --no-install-recommends osslsigncode openssl
-          # Run the signing script — it auto-detects CA vs self-signed mode
+          # Run the signing script — auto-detects CA PFX vs self-signed mode
           bash sign_exe.sh dist/AutoWarmUp.exe "Auto Warm-Up" "https://github.com/adityabhalsod/auto-warm-up"
         env:
           CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
           CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
 
-      # Verify the .exe has proper PE metadata and signature
+      # Verify the signature on the final .exe
       - name: Verify .exe signature
         run: |
+          sudo apt-get install -y --no-install-recommends osslsigncode 2>/dev/null || true
           echo "=== Signature Verification ==="
           osslsigncode verify dist/AutoWarmUp.exe 2>&1 | head -15 || true
           echo ""
@@ -239,14 +314,14 @@ jobs:
           file dist/AutoWarmUp.exe
           ls -lh dist/AutoWarmUp.exe
 
-      # Upload the signed .exe as a build artifact for the release stage
-      - name: Upload build artifact
+      # Upload the signed .exe for the release stage
+      - name: Upload signed artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AutoWarmUp-exe               # Artifact name for download
-          path: dist/AutoWarmUp.exe          # Path to the signed executable
-          retention-days: 5                  # Keep artifact for 5 days
-          if-no-files-found: error           # Fail if .exe wasn't produced
+          name: AutoWarmUp-exe               # Final artifact name for release
+          path: dist/AutoWarmUp.exe
+          retention-days: 5
+          if-no-files-found: error
 
   # =========================================================
   #  STAGE 3: RELEASE — Tag repo and publish GitHub Release
@@ -254,7 +329,7 @@ jobs:
   release:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [prepare, build]  # Wait for both version info and the signed .exe
+    needs: [prepare, sign]  # Wait for version info and the signed .exe
 
     permissions:
       contents: write  # Required to create tags and releases
@@ -302,6 +377,7 @@ jobs:
             - **Icon:** Embedded multi-resolution application icon
             - **Version Info:** PE metadata with company, description, and version
             - **Signed:** Authenticode signed (SHA-256 + RFC 3161 timestamp)
+            - **Auto-Start:** Right-click tray icon → "Start on Boot" to enable
             - **No installation required** — just download and double-click
 
             > 💡 Download `AutoWarmUp.exe` below and double-click to run.

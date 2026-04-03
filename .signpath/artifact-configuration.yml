@@ -1,0 +1,16 @@
+# =============================================================
+#  SignPath.io Configuration — Auto Warm-Up
+#  This file tells SignPath how to sign the artifacts.
+#  See: https://about.signpath.io/documentation/signing-policy
+# =============================================================
+
+# Define the artifact configuration for signing
+artifact-configuration:
+  # Name displayed in the SignPath dashboard
+  name: AutoWarmUp
+  # Version of this config schema
+  version: "1.0"
+  # Signing configuration for PE executables
+  pe-file:
+    # Path pattern matching the .exe to sign inside the uploaded artifact
+    path: "AutoWarmUp.exe"
