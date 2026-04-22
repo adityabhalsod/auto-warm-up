@@ -158,11 +158,23 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # =========================================================
-  #  STAGE 2: BUILD — Cross-compile, embed icon/version, sign
+  #  STAGE 2: BUILD — Compile .exe natively on Windows with Nuitka
+  #
+  #  We intentionally use a native Windows runner + Nuitka instead
+  #  of Ubuntu + Docker + Wine + PyInstaller. Reasons:
+  #    * Nuitka compiles Python -> C -> native PE binary. There is
+  #      no shared bootloader stub for antivirus engines to
+  #      fingerprint, so heuristic false positives (McAfee, Avast,
+  #      Bitdefender, Defender, etc.) are drastically reduced.
+  #    * PyInstaller --onefile uses the same bootloader for every
+  #      build on earth, which is routinely abused by malware and
+  #      therefore pre-flagged by many AV vendors on sight.
+  #    * Cross-compiling via Wine adds further heuristic weight
+  #      (odd section layout, Wine-built import table quirks).
   # =========================================================
   build:
-    name: Build & Sign Windows .exe
-    runs-on: ubuntu-latest
+    name: Build Windows .exe (Nuitka)
+    runs-on: windows-latest
     needs: prepare  # Wait for version info from prepare stage
 
     steps:
@@ -170,50 +182,62 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Reclaim disk space on the runner for the Docker build
-      - name: Free disk space
-        run: |
-          # Remove unused runner toolchains to free ~10 GB
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          df -h /
-
-      # Inject the computed version into the VERSION file before Docker build
+      # Inject the computed version into the VERSION file before build
       # This ensures the .exe embeds the correct version (including pre-release suffix)
       - name: Set version for build
+        shell: bash
         run: |
           # Write the computed version (e.g. 1.0.0-beta.3) into VERSION file
           echo "${{ needs.prepare.outputs.version }}" > VERSION
           echo "Building with version: $(cat VERSION)"
 
-      # Set up Docker Buildx — required for GHA caching and load support
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Build the Docker image — this generates icon, version info, builds .exe, and signs it
-      - name: Build signed .exe via Docker (Wine + PyInstaller + osslsigncode)
-        uses: docker/build-push-action@v5
+      # Install a pinned Python so Nuitka's C compilation is reproducible
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          context: .               # Use the repo root as Docker context
-          push: false              # Don't push to a registry, just build locally
-          load: true               # Load the built image into the local Docker daemon
-          tags: auto-warm-up-builder:latest
-          cache-from: type=gha     # Pull cache layers from GitHub Actions cache
-          cache-to: type=gha,mode=max  # Push all layers to cache for next build
+          python-version: "3.12"
+          cache: pip
 
-      # Extract the .exe from the Docker container to the runner filesystem
-      - name: Extract .exe from container
+      # Install build and runtime dependencies
+      - name: Install dependencies
         run: |
-          # Create a temporary container from the built image (don't start it)
-          CONTAINER_ID=$(docker create auto-warm-up-builder:latest)
-          # Create output directory on the runner
-          mkdir -p dist
-          # Copy the .exe out of the container's /app/dist/ directory
-          docker cp "${CONTAINER_ID}:/app/dist/AutoWarmUp.exe" dist/AutoWarmUp.exe
-          # Clean up the temporary container
-          docker rm "${CONTAINER_ID}"
-          # Verify the .exe was extracted and show its size
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Generate the multi-size .ico icon
+      - name: Generate application icon
+        run: python generate_icon.py app.ico
+
+      # Build the .exe with Nuitka (native PE, low AV false-positive rate)
+      - name: Build .exe with Nuitka
+        shell: bash
+        run: |
+          # Read the version injected above
+          APP_VERSION=$(cat VERSION | tr -d '[:space:]')
+
+          # Nuitka onefile build. Key anti-FP choices:
+          #   - standalone + onefile: self-contained .exe
+          #   - windows-console-mode=disable: tray app, no console
+          #   - NO UPX, NO packer: AV engines heavily flag packed binaries
+          #   - Embed full PE VERSIONINFO so file properties look legitimate
+          python -m nuitka \
+            --standalone \
+            --onefile \
+            --assume-yes-for-downloads \
+            --windows-console-mode=disable \
+            --windows-icon-from-ico=app.ico \
+            --company-name="Aditya Bhalsod" \
+            --product-name="Auto Warm-Up" \
+            --file-version="${APP_VERSION}" \
+            --product-version="${APP_VERSION}" \
+            --file-description="Keep-alive utility that prevents Windows screen lock" \
+            --copyright="Copyright (c) 2024-2026 Aditya Bhalsod. MIT License." \
+            --output-dir=dist \
+            --output-filename=AutoWarmUp.exe \
+            --remove-output \
+            auto_warm_up.py
+
+          # Verify the build produced the expected artifact
           ls -lh dist/AutoWarmUp.exe
 
       # Upload the unsigned .exe as a build artifact for the signing stage
@@ -258,8 +282,12 @@ jobs:
             echo "method=pfx" >> "$GITHUB_OUTPUT"
             echo "Detected: Custom PFX certificate configured"
           else
-            echo "method=selfsigned" >> "$GITHUB_OUTPUT"
-            echo "Detected: No signing secrets — using self-signed fallback"
+            # No real certificate available. We intentionally do NOT
+            # self-sign here because self-signed code-signing certificates
+            # HURT antivirus reputation (AV engines treat "unknown publisher"
+            # signatures as more suspicious than an unsigned binary).
+            echo "method=unsigned" >> "$GITHUB_OUTPUT"
+            echo "Detected: No signing secrets — releasing unsigned (better AV reputation than self-signed)"
           fi
         env:
           SIGNPATH_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -290,18 +318,29 @@ jobs:
           cp dist/signed/AutoWarmUp.exe dist/AutoWarmUp.exe
           echo "Signed with SignPath.io (CA certificate — Publisher will appear)"
 
-      # Option 2: Sign with custom PFX or self-signed fallback
-      # Runs only if SignPath was not used
-      - name: Sign with PFX or self-signed fallback
-        if: steps.detect.outputs.method != 'signpath'
+      # Option 2: Sign with a real CA-issued PFX certificate, if provided.
+      # If no PFX is configured, this step is skipped entirely -- we keep the
+      # unsigned binary rather than self-signing, because self-signed binaries
+      # typically INCREASE antivirus false-positive rates.
+      - name: Sign with CA-issued PFX certificate
+        if: steps.detect.outputs.method == 'pfx'
         run: |
           # Install osslsigncode and openssl on the runner
           sudo apt-get update && sudo apt-get install -y --no-install-recommends osslsigncode openssl
-          # Run the signing script — auto-detects CA PFX vs self-signed mode
+          # Run the signing script -- only uses the PFX path (ALLOW_SELF_SIGN unset)
           bash sign_exe.sh dist/AutoWarmUp.exe "Auto Warm-Up" "https://github.com/adityabhalsod/auto-warm-up"
         env:
           CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
           CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
+
+      # Option 3: No signing secrets configured -- release the unsigned binary.
+      # This is intentional: self-signing hurts AV reputation more than it helps.
+      - name: Skip signing (no CA certificate configured)
+        if: steps.detect.outputs.method == 'unsigned'
+        run: |
+          echo "No code-signing certificate configured -- releasing unsigned binary."
+          echo "This is intentional: self-signed certificates increase AV false positives."
+          echo "To sign properly, configure SignPath.io or a CA-issued PFX certificate."
 
       # Verify the signature on the final .exe
       - name: Verify .exe signature
@@ -374,9 +413,10 @@ jobs:
             ---
 
             ### Binary Details
+            - **Builder:** Nuitka (Python compiled to native C/PE — low antivirus false-positive rate)
             - **Icon:** Embedded multi-resolution application icon
             - **Version Info:** PE metadata with company, description, and version
-            - **Signed:** Authenticode signed (SHA-256 + RFC 3161 timestamp)
+            - **Code Signing:** Signed only when a CA certificate is configured on the project; otherwise released unsigned (self-signing is intentionally avoided because it increases AV false positives)
             - **Auto-Start:** Right-click tray icon → "Start on Boot" to enable
             - **No installation required** — just download and double-click
 
