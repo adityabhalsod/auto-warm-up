@@ -100,10 +100,33 @@ elif [ -n "${CODESIGN_PFX_FILE:-}" ] && [ -f "${CODESIGN_PFX_FILE}" ]; then
     echo "  Signed with CA certificate — Publisher will appear on SmartScreen"
 
 else
-    # --- Mode 2: Self-signed fallback (local dev only) ---
-    echo "[MODE] No CA certificate found — falling back to self-signed"
+    # --- Mode 2: Self-signed fallback (opt-in only) ---
+    #
+    # IMPORTANT: Self-signed Authenticode signatures typically HURT antivirus
+    # reputation rather than help it. Many AV engines (including McAfee and
+    # Windows Defender) treat an "unknown publisher" signature as more
+    # suspicious than an unsigned binary, because real malware authors
+    # frequently self-sign to look legitimate.
+    #
+    # Therefore self-signing is now opt-in: you must explicitly set
+    # ALLOW_SELF_SIGN=1 to use this path. Otherwise we skip signing
+    # entirely, which is the correct choice for public distribution
+    # unless you have a real CA-issued code-signing certificate.
+    if [ "${ALLOW_SELF_SIGN:-0}" != "1" ]; then
+        echo "[MODE] No CA certificate provided -- skipping signing."
+        echo "  Self-signed signatures HURT antivirus reputation, so they"
+        echo "  are disabled by default. To force self-signing anyway, set"
+        echo "  ALLOW_SELF_SIGN=1. To sign properly, provide a real CA cert"
+        echo "  via CODESIGN_PFX_BASE64 + CODESIGN_PFX_PASSWORD."
+        echo ""
+        echo "=== Signing Skipped (unsigned binary kept as-is) ==="
+        exit 0
+    fi
+
+    echo "[MODE] ALLOW_SELF_SIGN=1 -- falling back to self-signed (not recommended)"
     echo "  WARNING: Self-signed = Publisher will NOT appear on SmartScreen"
-    echo "  To fix: set CODESIGN_PFX_BASE64 + CODESIGN_PFX_PASSWORD env vars"
+    echo "  WARNING: Self-signed often INCREASES antivirus false-positive rate"
+    echo "  To fix properly: set CODESIGN_PFX_BASE64 + CODESIGN_PFX_PASSWORD env vars"
     echo ""
 
     # Paths for self-signed cert generation
