@@ -147,11 +147,18 @@ Go to [Releases](../../releases/latest) and download `AutoWarmUp.exe`. That's it
 git clone https://github.com/adityabhalsod/auto-warm-up.git
 cd auto-warm-up
 
-:: Run the build script
+:: Run the build script (uses Nuitka by default -- lowest AV false-positive rate)
 build.bat
+
+:: Legacy PyInstaller path (higher AV false-positive rate, kept for compatibility):
+:: build.bat --pyinstaller
 ```
 
 Your `.exe` will be at `dist\AutoWarmUp.exe`.
+
+> **Why Nuitka by default?** Nuitka compiles Python to C to a real native PE binary, so
+> antivirus engines can't fingerprint a shared bootloader (the main reason PyInstaller
+> builds get flagged as malware). See the [false-positive FAQ](#-faq) for details.
 
 <details>
 <summary><strong>Manual build commands</strong></summary>
@@ -315,6 +322,34 @@ No drivers, no registry changes, no system services.
 <summary><strong>Will IT / endpoint protection detect it?</strong></summary>
 
 Auto Warm-Up doesn't install anything, modify the registry, change group policy, or run as a service. It's a standard user-space application that simulates mouse input — functionally identical to moving your physical mouse. Most endpoint protection tools won't flag it, but policies vary by organization.
+</details>
+
+<details>
+<summary><strong>My antivirus flagged AutoWarmUp.exe as a threat — is it malware?</strong></summary>
+
+**No — this is a false positive.** The source code in this repo is the complete source (≈300 lines of Python) and only does two things: simulate a 1-pixel mouse movement and call `SetThreadExecutionState`. You can read every line.
+
+The detection is a **heuristic false positive** triggered by how the `.exe` is packaged, not by what it does. Specifically:
+
+1. **PyInstaller `--onefile` bootloader** — the same bootloader is reused by real malware authors who bundle malicious Python scripts, so AV engines (McAfee, Avast, Bitdefender, and others) flag the bootloader signature on sight, regardless of the payload.
+2. **`SendInput` API** — AVs associate synthetic input with keyloggers and automation malware.
+3. **Registry autostart** (`HKCU\...\Run`) — a classic malware persistence pattern, even though here it's an opt-in user-visible menu item.
+
+**What we do about it:**
+- The default Windows build now uses **[Nuitka](https://nuitka.net/)** instead of PyInstaller. Nuitka compiles Python to C to a real native PE binary, so there is no shared bootloader for AVs to fingerprint. This dramatically reduces false-positive rates.
+- The build pipeline no longer self-signs the `.exe`. Self-signed code-signing certificates actually **increase** AV suspicion ("unknown publisher pretending to be legitimate"). An unsigned binary is treated better by most engines.
+- Builds use `--noupx` to avoid UPX compression, which is another major AV heuristic trigger.
+
+**What you can do if you hit this (McAfee example):**
+1. **Report the false positive to your AV vendor** — vendors process these reports and whitelist the binary. This is the fastest permanent fix:
+   - McAfee: <https://www.mcafee.com/enterprise/en-us/threat-center/submit-sample.html>
+   - Windows Defender: <https://www.microsoft.com/en-us/wdsi/filesubmission>
+   - Others: search "submit false positive &lt;your AV&gt;".
+2. **Restore from quarantine** and add `AutoWarmUp.exe` to the AV's allow-list / exclusions.
+3. **Build from source** — clone this repo, run `build.bat`, inspect the code yourself. The Nuitka build has materially fewer false positives than the pre-built PyInstaller release.
+4. **Scan on [VirusTotal](https://www.virustotal.com/)** — most engines will pass; the few that flag it will typically clear after a vendor report.
+
+We do not sell, distribute, or bundle anything with this utility. No telemetry, no network calls, no installer.
 </details>
 
 <details>

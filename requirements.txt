@@ -1,4 +1,19 @@
 # Pin exact versions for reproducible builds
 pystray==0.19.5
 Pillow==10.4.0
+
+# --- Build tools (only needed when building the .exe) ---
+
+# Nuitka: primary Windows builder. Compiles Python -> C -> native .exe.
+# Produces a real PE binary, NOT a PyInstaller-bootloader-wrapped archive,
+# so antivirus false-positive rates are dramatically lower (especially
+# on McAfee, Windows Defender, and other heuristic-heavy engines).
+nuitka==2.5.1
+# zstandard speeds up Nuitka's onefile payload compression
+zstandard==0.23.0
+# ordered-set is a Nuitka recommended dependency
+ordered-set==4.1.0
+
+# PyInstaller: kept as fallback (and used by the Linux/Docker cross-compile
+# path). Higher AV FP rate than Nuitka, so prefer Nuitka on native Windows.
 pyinstaller==6.11.1
