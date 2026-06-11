@@ -200,7 +200,7 @@ This project uses **GitHub Actions** to automatically build and release `.exe` f
 │                    GitHub Actions Pipeline                 │
 │                                                            │
 │  ┌──────────────┐   ┌──────────────┐   ┌────────────────┐  │
-│  │   PREPARE    │──▶│    BUILD     │──▶│    RELEASE     │  │
+│  │   PREPARE    │──▶│    BUILD     │──▶│    RELEASE    │  │
 │  │   (~1 min)   │   │  (~6-8 min)  │   │    (~1 min)    │  │
 │  ├──────────────┤   ├──────────────┤   ├────────────────┤  │
 │  │ • Checkout   │   │ • Checkout   │   │ • Download .exe│  │
